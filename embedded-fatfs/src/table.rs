@@ -880,4 +880,24 @@ mod tests {
             Some(FatValue::Data(0xA))
         );
     }
+
+    #[tokio::test]
+    async fn free_returns_error_on_link_to_cluster_one() {
+        type S = FailingReads<FromTokio<Cursor<Vec<u8>>>>;
+        let mut storage = fat32_with_failing_reads();
+        storage.inner.seek(io::SeekFrom::Start(0xA * 4)).await.unwrap();
+        storage.inner.write_all(&1_u32.to_le_bytes()).await.unwrap();
+        {
+            let mut iter = ClusterIterator::<&mut S, std::io::Error, S>::new(&mut storage, FatType::Fat32, 0x9);
+            assert!(matches!(iter.free().await, Err(Error::CorruptedFileSystem)));
+        }
+        assert_eq!(
+            read_fat(&mut storage, FatType::Fat32, 0x9).await.ok(),
+            Some(FatValue::Free)
+        );
+        assert_eq!(
+            read_fat(&mut storage, FatType::Fat32, 0xA).await.ok(),
+            Some(FatValue::Data(1))
+        );
+    }
 }
