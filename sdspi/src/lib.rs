@@ -493,7 +493,7 @@ async fn with_timeout<D: embedded_hal_async::delay::DelayNs, F: Future>(
 /// Fails unless a command's R1 response reports no error. A data command the card rejected must
 /// not be followed by a data phase.
 fn check_r1(r1: u8) -> Result<(), Error> {
-    if r1 == 0 {
+    if r1 == R1_READY_STATE {
         Ok(())
     } else {
         Err(Error::RegisterError(r1))
