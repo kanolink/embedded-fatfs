@@ -7,11 +7,15 @@ use core::fmt::Debug;
 use core::future::Future;
 use core::marker::PhantomData;
 use embassy_futures::select::{select, Either};
+use embassy_futures::yield_now;
 use sdio_host::sd::{CardCapacity, CID, CSD, OCR, SD};
 use sdio_host::{common_cmd::*, sd_cmd::*};
 
 // MUST be the first module listed
 mod fmt;
+
+#[cfg(test)]
+mod tests;
 
 /// Status for card in the ready state
 pub const R1_READY_STATE: u8 = 0x00;
@@ -120,6 +124,7 @@ where
                     if r == R1_IDLE_STATE {
                         return Ok(());
                     }
+                    yield_now().await;
                 }
             })
             .await??;
@@ -144,6 +149,7 @@ where
                     if buffer[3] == 0xAA {
                         return Ok(());
                     }
+                    yield_now().await;
                 }
             })
             .await??;
@@ -160,6 +166,7 @@ where
                     if r == R1_READY_STATE {
                         return Ok(());
                     }
+                    yield_now().await;
                 }
             })
             .await??;
@@ -180,6 +187,7 @@ where
                     if !ocr.is_busy() {
                         return Ok(ocr);
                     }
+                    yield_now().await;
                 }
             })
             .await??;
@@ -328,14 +336,7 @@ where
     }
 
     async fn read_data(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
-        let r = with_timeout(self.delay.clone(), 1000, async {
-            let mut byte = 0xFF;
-            while byte == 0xFF {
-                byte = self.read_byte().await?;
-            }
-            Ok(byte)
-        })
-        .await??;
+        let r = with_timeout(self.delay.clone(), 1000, self.poll_byte(|b| b != 0xFF)).await??;
 
         if r != DATA_START_BLOCK {
             return Err(Error::RegisterError(r));
@@ -410,15 +411,8 @@ where
                 .map_err(|_| Error::SpiError)?;
         }
 
-        let byte = with_timeout(self.delay.clone(), 1000, async {
-            loop {
-                let byte = self.read_byte().await?;
-                if byte & 0x80 == 0 {
-                    return Ok(byte);
-                }
-            }
-        })
-        .await??;
+        let byte =
+            with_timeout(self.delay.clone(), 1000, self.poll_byte(|b| b & 0x80 == 0)).await??;
 
         Ok(byte)
     }
@@ -429,12 +423,38 @@ where
         self.cmd(cmd).await
     }
 
+    /// Waits until the card stops signalling busy. After 16 polls it sleeps 100 µs before each
+    /// further poll. This is the driver's only `delay_us` call, so a delay implementation can time
+    /// it as card busy time.
     async fn wait_idle(&mut self) -> Result<(), Error> {
+        let mut sleep = self.delay.clone();
         with_timeout(self.delay.clone(), 5000, async {
-            while self.read_byte().await? != 0xFF {}
+            let mut polls = 0;
+            while self.read_byte().await? != 0xFF {
+                polls += 1;
+                if polls > 16 {
+                    sleep.delay_us(100).await;
+                }
+            }
             Ok(())
         })
         .await?
+    }
+
+    /// Reads bytes until `done` accepts one. It yields every 8 bytes, so the caller's timeout can
+    /// run on a bus that finishes transfers without suspending.
+    async fn poll_byte(&mut self, done: impl Fn(u8) -> bool) -> Result<u8, Error> {
+        let mut polls = 0u32;
+        loop {
+            let byte = self.read_byte().await?;
+            if done(byte) {
+                return Ok(byte);
+            }
+            polls += 1;
+            if polls.is_multiple_of(8) {
+                yield_now().await;
+            }
+        }
     }
 
     async fn read_byte(&mut self) -> Result<u8, Error> {
