@@ -8,5 +8,5 @@ mod fmt;
 mod buf_stream;
 mod stream_slice;
 
-pub use buf_stream::{BufStream, BufStreamError};
+pub use buf_stream::{BufStream, BufStreamError, Slot};
 pub use stream_slice::{StreamSlice, StreamSliceError};

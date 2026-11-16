@@ -39,39 +39,105 @@ impl<T: core::fmt::Debug> embedded_io_async::Error for BufStreamError<T> {
 
 /// A Stream wrapper for accessing a stream in block sized chunks.
 ///
-/// [`BufStream<T, const SIZE: usize, const ALIGN: usize`](BufStream) can be initialized with the following parameters.
+/// [`BufStream<T, const SIZE: usize, B>`](BufStream) can be initialized with the following parameters.
 ///
 /// - `T`: The inner stream.
-/// - `SIZE`: The size of the block, this dictates the size of the internal buffer.
-/// - `ALIGN`: The alignment of the internal buffer.
+/// - `SIZE`: The size of the block, this dictates the size of the internal buffers.
+/// - `B`: The [`Slot`]s that hold blocks in memory: by default one slot inside the stream ([`BufStream::new`]).
+///   [`BufStream::with_slots`] takes an array of slots, or a reference to slots kept elsewhere, such as in a
+///   `static`. A stream that is part of an `async` task's state is moved and copied with it; slots kept
+///   elsewhere stay out of those copies.
 ///
 /// If the `buf` provided to either [`Read::read`] or [`Write::write`] meets the following conditions the `buf`
-/// will be used directly instead of the intermediate buffer to avoid unnecessary copies:
+/// will be used directly instead of an intermediate buffer to avoid unnecessary copies:
 ///
 /// - `buf.len()` is a multiple of block size
-/// - `buf` has the same alignment as the internal buffer
+/// - `buf` has the same alignment as the internal buffers
 /// - The byte address of the inner device is aligned to a block size.
 ///
-/// [`BufStream<T, const SIZE: usize, const ALIGN: usize`](BufStream) implements the [`embedded_io_async`] traits, and implicitly
-/// handles the RMW (Read, Modify, Write) cycle for you.
-pub struct BufStream<T: BlockDevice<SIZE>, const SIZE: usize> {
+/// [`BufStream`] implements the [`embedded_io_async`] traits, and implicitly handles the RMW (Read, Modify,
+/// Write) cycle for you.
+///
+/// With one slot, a caller that alternates between two blocks makes every access write one block back and read
+/// the other. A FAT filesystem with a mirrored table does that for each cluster it allocates or frees, so two
+/// slots let it change a whole table sector, and its mirror, with one read and one write each. A modified block
+/// stays in memory until its last byte is written, its slot is needed for another block, or [`Write::flush`].
+pub struct BufStream<
+    T: BlockDevice<SIZE>,
+    const SIZE: usize,
+    B = [Slot<<T as BlockDevice<SIZE>>::Align, SIZE>; 1],
+> {
     inner: T,
-    buffer: Aligned<T::Align, [u8; SIZE]>,
-    current_block: u32,
+    slots: B,
+    /// Counts slot uses, so the least recently used slot can be found.
+    uses: u32,
     current_offset: u64,
+}
+
+/// Marks a slot that holds no block.
+const NO_BLOCK: u32 = u32::MAX;
+
+/// One block kept in memory by a [`BufStream`].
+pub struct Slot<ALIGN, const SIZE: usize> {
+    buffer: Aligned<ALIGN, [u8; SIZE]>,
+    block: u32,
     dirty: bool,
+    /// Value of [`BufStream::uses`] when the slot was last used.
+    used: u32,
+}
+
+impl<ALIGN: aligned::Alignment, const SIZE: usize> Slot<ALIGN, SIZE> {
+    /// An empty slot.
+    pub const fn new() -> Self {
+        Self {
+            buffer: Aligned([0; SIZE]),
+            block: NO_BLOCK,
+            dirty: false,
+            used: 0,
+        }
+    }
+}
+
+impl<ALIGN: aligned::Alignment, const SIZE: usize> Default for Slot<ALIGN, SIZE> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T: BlockDevice<SIZE>, const SIZE: usize> BufStream<T, SIZE> {
-    const ALIGN: usize = core::mem::align_of::<Aligned<T::Align, [u8; SIZE]>>();
-    /// Create a new [`BufStream`] around a hardware block device.
+    /// Create a new [`BufStream`] around a hardware block device, with one slot inside the stream.
     pub fn new(inner: T) -> Self {
+        Self::with_slots(inner, [Slot::new()])
+    }
+}
+
+impl<T: BlockDevice<SIZE>, const SIZE: usize, B: AsMut<[Slot<T::Align, SIZE>]>>
+    BufStream<T, SIZE, B>
+{
+    const ALIGN: usize = core::mem::align_of::<Aligned<T::Align, [u8; SIZE]>>();
+
+    /// Create a new [`BufStream`] around a hardware block device that keeps blocks in `slots`.
+    ///
+    /// The slots are emptied first: what an earlier stream left in them is not used.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `slots` is empty.
+    pub fn with_slots(inner: T, mut slots: B) -> Self {
+        assert!(
+            !slots.as_mut().is_empty(),
+            "BufStream needs at least one slot"
+        );
+        for slot in slots.as_mut() {
+            slot.block = NO_BLOCK;
+            slot.dirty = false;
+            slot.used = 0;
+        }
         Self {
             inner,
-            current_block: u32::MAX,
+            slots,
+            uses: 0,
             current_offset: 0,
-            buffer: Aligned([0; SIZE]),
-            dirty: false,
         }
     }
 
@@ -92,49 +158,82 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> BufStream<T, SIZE> {
             .expect("Block larger than 2TB")
     }
 
-    async fn flush(&mut self) -> Result<(), T::Error> {
-        // flush the internal buffer if we have modified the buffer
-        if self.dirty {
+    /// Writes the slot's block to the device if it was modified.
+    async fn flush_slot(&mut self, index: usize) -> Result<(), T::Error> {
+        let slot = &mut self.slots.as_mut()[index];
+        if slot.dirty {
             // Note, alignment of internal buffer is guarenteed at compile time so we don't have to check it here
             self.inner
-                .write(self.current_block, slice_to_blocks(&self.buffer[..]))
+                .write(slot.block, slice_to_blocks(&slot.buffer[..]))
                 .await?;
             // Only a completed write cleans the buffer; after a failure the next flush retries it.
-            self.dirty = false;
+            slot.dirty = false;
         }
         Ok(())
     }
 
-    async fn check_cache(&mut self) -> Result<(), T::Error> {
-        let block_start = self.pointer_block_start();
-        if block_start != self.current_block {
-            // we may have modified data in old block, flush it to disk
-            self.flush().await?;
-            // We have seeked to a new block, read it. A failed read can leave partial data in the
-            // buffer, so it must not stay labelled as the old block.
-            self.current_block = u32::MAX;
-            let buf = &mut self.buffer[..];
-            self.inner
-                .read(block_start, slice_to_blocks_mut(buf))
-                .await?;
-            self.current_block = block_start;
+    /// Writes every modified block to the device.
+    async fn flush(&mut self) -> Result<(), T::Error> {
+        for index in 0..self.slot_count() {
+            self.flush_slot(index).await?;
         }
         Ok(())
     }
 
-    /// Returns true if the cached block is in the `len` bytes that start at the current block.
-    fn cache_in_range(&self, len: usize) -> bool {
+    /// Returns the slot that holds the block under the pointer, reading the block first if no slot has it.
+    async fn load(&mut self) -> Result<usize, T::Error> {
+        let block = self.pointer_block_start();
+        self.uses = self.uses.wrapping_add(1);
+        let uses = self.uses;
+        let slots = self.slots.as_mut();
+        let index = match slots.iter().position(|slot| slot.block == block) {
+            Some(index) => index,
+            None => {
+                // An empty slot if there is one, else the slot unused for the longest.
+                let index = slots
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, slot)| (slot.block == NO_BLOCK, uses.wrapping_sub(slot.used)))
+                    .map(|(index, _)| index)
+                    .expect("at least one slot");
+                // The slot may hold modified data of another block; write it to the device first.
+                self.flush_slot(index).await?;
+                // A failed read can leave partial data in the buffer, so it must not stay labelled as the old
+                // block.
+                let slot = &mut self.slots.as_mut()[index];
+                slot.block = NO_BLOCK;
+                self.inner
+                    .read(block, slice_to_blocks_mut(&mut slot.buffer[..]))
+                    .await?;
+                slot.block = block;
+                index
+            }
+        };
+        self.slots.as_mut()[index].used = uses;
+        Ok(index)
+    }
+
+    /// Returns true if the slot's block is in the `len` bytes that start at the current block.
+    fn in_range(&mut self, index: usize, len: usize) -> bool {
         let start = u64::from(self.pointer_block_start());
         let end = start + (len / SIZE) as u64;
-        (start..end).contains(&u64::from(self.current_block))
+        (start..end).contains(&u64::from(self.slots.as_mut()[index].block))
+    }
+
+    fn slot_count(&mut self) -> usize {
+        self.slots.as_mut().len()
     }
 }
 
-impl<T: BlockDevice<SIZE>, const SIZE: usize> embedded_io_async::ErrorType for BufStream<T, SIZE> {
+impl<T: BlockDevice<SIZE>, const SIZE: usize, B> embedded_io_async::ErrorType
+    for BufStream<T, SIZE, B>
+{
     type Error = BufStreamError<T::Error>;
 }
 
-impl<T: BlockDevice<SIZE>, const SIZE: usize> Read for BufStream<T, SIZE> {
+impl<T: BlockDevice<SIZE>, const SIZE: usize, B: AsMut<[Slot<T::Align, SIZE>]>> Read
+    for BufStream<T, SIZE, B>
+{
     async fn read(&mut self, mut buf: &mut [u8]) -> Result<usize, Self::Error> {
         // A zero-length read must be a no-op: forwarding it would otherwise
         // satisfy the block-aligned fast path below and issue a 0-block device
@@ -150,9 +249,11 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Read for BufStream<T, SIZE> {
                 && self.current_offset % SIZE as u64 == 0
             {
                 // If the provided buffer has a suitable length and alignment _and_ the read head is on a block boundary, use it directly
-                // The device must have the data of a modified cached block before we read it.
-                if self.cache_in_range(buf.len()) {
-                    self.flush().await?;
+                // The device must have the data of a modified block in memory before we read it.
+                for index in 0..self.slot_count() {
+                    if self.in_range(index, buf.len()) {
+                        self.flush_slot(index).await?;
+                    }
                 }
                 let block = self.pointer_block_start();
                 self.inner.read(block, slice_to_blocks_mut(buf)).await?;
@@ -168,7 +269,7 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Read for BufStream<T, SIZE> {
                     block_end
                 );
 
-                self.check_cache().await?;
+                let index = self.load().await?;
 
                 // copy as much as possible, up to the block boundary
                 let buffer_offset = (self.current_offset - block_start) as usize;
@@ -177,7 +278,8 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Read for BufStream<T, SIZE> {
                 let end = core::cmp::min(buffer_offset + bytes_to_read, SIZE);
                 trace!("buffer_offset {}, end {}", buffer_offset, end);
                 let bytes_read = end - buffer_offset;
-                buf[..bytes_read].copy_from_slice(&self.buffer[buffer_offset..end]);
+                buf[..bytes_read]
+                    .copy_from_slice(&self.slots.as_mut()[index].buffer[buffer_offset..end]);
                 buf = &mut buf[bytes_read..]; // move the buffer along
 
                 bytes_read
@@ -193,7 +295,9 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Read for BufStream<T, SIZE> {
     }
 }
 
-impl<T: BlockDevice<SIZE>, const SIZE: usize> Write for BufStream<T, SIZE> {
+impl<T: BlockDevice<SIZE>, const SIZE: usize, B: AsMut<[Slot<T::Align, SIZE>]>> Write
+    for BufStream<T, SIZE, B>
+{
     async fn write(&mut self, mut buf: &[u8]) -> Result<usize, Self::Error> {
         // A zero-length write must be a no-op: forwarding it would otherwise
         // satisfy the block-aligned fast path below and issue a 0-block device
@@ -209,10 +313,13 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Write for BufStream<T, SIZE> {
                 && self.current_offset % SIZE as u64 == 0
             {
                 // If the provided buffer has a suitable length and alignment _and_ the write head is on a block boundary, use it directly
-                // This write replaces a cached block in its range, so discard the cache.
-                if self.cache_in_range(buf.len()) {
-                    self.current_block = u32::MAX;
-                    self.dirty = false;
+                // This write replaces the blocks in its range, so discard the ones in memory.
+                for index in 0..self.slot_count() {
+                    if self.in_range(index, buf.len()) {
+                        let slot = &mut self.slots.as_mut()[index];
+                        slot.block = NO_BLOCK;
+                        slot.dirty = false;
+                    }
                 }
                 let block = self.pointer_block_start();
                 self.inner.write(block, slice_to_blocks(buf)).await?;
@@ -228,8 +335,8 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Write for BufStream<T, SIZE> {
                     block_end
                 );
 
-                // reload the cache if we need to
-                self.check_cache().await?;
+                // read the block into a slot if we need to
+                let index = self.load().await?;
 
                 // copy as much as possible, up to the block boundary
                 let buffer_offset = (self.current_offset - block_start) as usize;
@@ -238,18 +345,19 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Write for BufStream<T, SIZE> {
                 let end = core::cmp::min(buffer_offset + bytes_to_write, SIZE);
                 trace!("buffer_offset {}, end {}", buffer_offset, end);
                 let bytes_written = end - buffer_offset;
-                self.buffer[buffer_offset..buffer_offset + bytes_written]
+                let slot = &mut self.slots.as_mut()[index];
+                slot.buffer[buffer_offset..buffer_offset + bytes_written]
                     .copy_from_slice(&buf[..bytes_written]);
                 buf = &buf[bytes_written..]; // move the buffer along
 
-                // If we haven't written directly, we will use the cache, which will may need to flush later
+                // If we haven't written directly, the data is in the slot, which may need a flush later
                 // so we mark it as dirty
-                self.dirty = true;
+                slot.dirty = true;
 
                 // write out the whole block with the modified data
                 if block_start + end as u64 == block_end {
                     trace!("Flushing sector cache");
-                    self.flush().await?;
+                    self.flush_slot(index).await?;
                 }
 
                 bytes_written
@@ -270,7 +378,9 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Write for BufStream<T, SIZE> {
     }
 }
 
-impl<T: BlockDevice<SIZE>, const SIZE: usize> Seek for BufStream<T, SIZE> {
+impl<T: BlockDevice<SIZE>, const SIZE: usize, B: AsMut<[Slot<T::Align, SIZE>]>> Seek
+    for BufStream<T, SIZE, B>
+{
     async fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
         let (base, offset) = match pos {
             SeekFrom::Start(x) => (x, 0),
@@ -468,7 +578,7 @@ mod tests {
         block.write_all(&aligned_buffer[..]).await.unwrap();
 
         // if we wrote directly, the block buffer will be empty
-        assert_eq!(&block.buffer[..], [0u8; 512]);
+        assert_eq!(&block.slots[0].buffer[..], [0u8; 512]);
         // ensure that the current offset is still updated
         assert_eq!(block.current_offset, 512);
         // the write suceeded
@@ -497,7 +607,7 @@ mod tests {
         block.flush().await.unwrap();
 
         // because the addr was not block aligned, we will have used the cache
-        assert_ne!(&block.buffer[..], [0u8; 512]);
+        assert_ne!(&block.slots[0].buffer[..], [0u8; 512]);
         // the write suceeded
         assert_eq!(
             &block.into_inner().0.into_inner().into_inner()[3..515],
@@ -519,7 +629,7 @@ mod tests {
         block.read_exact(&mut aligned_buffer[..]).await.unwrap();
 
         // if we read directly, the block buffer will be empty
-        assert_eq!(&block.buffer[..], [0u8; 512]);
+        assert_eq!(&block.slots[0].buffer[..], [0u8; 512]);
         // ensure that the current offset is still updated
         assert_eq!(block.current_offset, 512);
         // the write suceeded
@@ -546,7 +656,7 @@ mod tests {
 
         // now, we must seek back and read the entire block
         // meaning our block cache will be written to:
-        assert_ne!(&block.buffer[..], [0u8; 512]);
+        assert_ne!(&block.slots[0].buffer[..], [0u8; 512]);
 
         // the read suceeded
         assert_eq!(
@@ -855,5 +965,200 @@ mod tests {
         assert_eq!(&data[..6], b"blk0ab");
         assert!(data[6..512].iter().all(|&byte| byte == 0));
         assert_eq!(&data[512..516], b"blk1");
+    }
+
+    /// Device that counts its block reads and writes.
+    struct CountingDevice {
+        data: Vec<u8>,
+        reads: usize,
+        writes: usize,
+        fail_next_write: bool,
+    }
+
+    impl BlockDevice<512> for CountingDevice {
+        type Error = Failed;
+        type Align = aligned::A4;
+
+        async fn read(
+            &mut self,
+            block_address: u32,
+            data: &mut [Aligned<Self::Align, [u8; 512]>],
+        ) -> Result<(), Self::Error> {
+            self.reads += 1;
+            for (index, block) in data.iter_mut().enumerate() {
+                let start = (block_address as usize + index) * 512;
+                block.copy_from_slice(&self.data[start..start + 512]);
+            }
+            Ok(())
+        }
+
+        async fn write(
+            &mut self,
+            block_address: u32,
+            data: &[Aligned<Self::Align, [u8; 512]>],
+        ) -> Result<(), Self::Error> {
+            if core::mem::take(&mut self.fail_next_write) {
+                return Err(Failed);
+            }
+            self.writes += 1;
+            for (index, block) in data.iter().enumerate() {
+                let start = (block_address as usize + index) * 512;
+                self.data[start..start + 512].copy_from_slice(&block[..]);
+            }
+            Ok(())
+        }
+
+        async fn size(&mut self) -> Result<u64, Self::Error> {
+            Ok(self.data.len() as u64)
+        }
+    }
+
+    type CountingStream<const SLOTS: usize> =
+        BufStream<CountingDevice, 512, [Slot<A4, 512>; SLOTS]>;
+
+    fn counting_stream<const SLOTS: usize>() -> CountingStream<SLOTS> {
+        BufStream::with_slots(
+            CountingDevice {
+                data: vec![0; 4096],
+                reads: 0,
+                writes: 0,
+                fail_next_write: false,
+            },
+            core::array::from_fn(|_| Slot::new()),
+        )
+    }
+
+    /// Writes four bytes at the same offset of two blocks in turn, as a filesystem does for an entry of a
+    /// mirrored table.
+    async fn alternate<const SLOTS: usize>(block: &mut CountingStream<SLOTS>, rounds: usize) {
+        for round in 0..rounds {
+            for start in [0, 1024] {
+                block
+                    .seek(SeekFrom::Start(start + 4 * round as u64))
+                    .await
+                    .unwrap();
+                block.write_all(&[round as u8 + 1; 4]).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn two_slots_keep_two_alternating_blocks_in_memory() {
+        let mut block = counting_stream::<2>();
+        alternate(&mut block, 10).await;
+        assert_eq!((block.inner.reads, block.inner.writes), (2, 0));
+        block.flush().await.unwrap();
+        let device = block.into_inner();
+        assert_eq!((device.reads, device.writes), (2, 2));
+        for round in 0..10 {
+            for start in [0, 1024] {
+                let at = start + 4 * round;
+                assert_eq!(&device.data[at..at + 4], [round as u8 + 1; 4]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_third_block_takes_the_slot_used_longest_ago() {
+        let mut block = counting_stream::<2>();
+        block.write_all(b"zero").await.unwrap();
+        block.seek(SeekFrom::Start(512)).await.unwrap();
+        block.write_all(b"one!").await.unwrap();
+        // Block 0 is used again, so block 1 is the one to give way.
+        block.seek(SeekFrom::Start(4)).await.unwrap();
+        block.write_all(b"more").await.unwrap();
+        block.seek(SeekFrom::Start(1024)).await.unwrap();
+        block.write_all(b"two!").await.unwrap();
+        // Block 1 reached the device when it lost its slot; blocks 0 and 2 are still only in memory.
+        assert_eq!(block.inner.writes, 1);
+        assert_eq!(&block.inner.data[512..516], b"one!");
+        assert_eq!(&block.inner.data[..4], [0; 4]);
+
+        let mut tmp = [0u8; 8];
+        block.seek(SeekFrom::Start(0)).await.unwrap();
+        block.read_exact(&mut tmp).await.unwrap();
+        assert_eq!(&tmp, b"zeromore");
+        assert_eq!(block.inner.reads, 3, "block 0 was still in memory");
+
+        block.flush().await.unwrap();
+        let device = block.into_inner();
+        assert_eq!(&device.data[..8], b"zeromore");
+        assert_eq!(&device.data[1024..1028], b"two!");
+    }
+
+    #[tokio::test]
+    async fn flush_writes_every_modified_block_and_retries_after_a_failure() {
+        let mut block = counting_stream::<2>();
+        alternate(&mut block, 1).await;
+        block.inner.fail_next_write = true;
+        assert!(block.flush().await.is_err());
+        assert_eq!(block.inner.writes, 0);
+
+        block.flush().await.unwrap();
+        assert_eq!(block.inner.writes, 2);
+        // Nothing is left to write.
+        block.flush().await.unwrap();
+        let device = block.into_inner();
+        assert_eq!(device.writes, 2);
+        assert_eq!(&device.data[..4], [1; 4]);
+        assert_eq!(&device.data[1024..1028], [1; 4]);
+    }
+
+    #[tokio::test]
+    async fn aligned_transfers_see_and_replace_blocks_in_any_slot() {
+        let mut block = counting_stream::<2>();
+        alternate(&mut block, 1).await;
+
+        // An aligned read of blocks 0..4 gets the modified data of both slots.
+        let mut whole: Aligned<A4, [u8; 2048]> = Aligned([0; 2048]);
+        block.seek(SeekFrom::Start(0)).await.unwrap();
+        block.read_exact(&mut whole[..]).await.unwrap();
+        assert_eq!(&whole[..4], [1; 4]);
+        assert_eq!(&whole[1024..1028], [1; 4]);
+
+        // An aligned write over both blocks replaces them; the slots must not write old data back.
+        alternate(&mut block, 1).await;
+        let fresh: Aligned<A4, [u8; 2048]> = Aligned([9; 2048]);
+        block.seek(SeekFrom::Start(0)).await.unwrap();
+        block.write_all(&fresh[..]).await.unwrap();
+        block.flush().await.unwrap();
+
+        let mut tmp = [0u8; 4];
+        block.seek(SeekFrom::Start(1024)).await.unwrap();
+        block.read_exact(&mut tmp).await.unwrap();
+        assert_eq!(tmp, [9; 4]);
+        assert!(block.into_inner().data[..2048]
+            .iter()
+            .all(|&byte| byte == 9));
+    }
+
+    #[tokio::test]
+    async fn slots_kept_outside_the_stream_start_empty() {
+        let mut slots: [Slot<A4, 512>; 2] = [Slot::new(), Slot::new()];
+        let device = {
+            let mut block = BufStream::with_slots(
+                CountingDevice {
+                    data: vec![0; 4096],
+                    reads: 0,
+                    writes: 0,
+                    fail_next_write: false,
+                },
+                &mut slots,
+            );
+            // Left modified in a slot and never flushed, as when a card is pulled.
+            block.write_all(b"lost").await.unwrap();
+            block.into_inner()
+        };
+        assert_eq!(&device.data[..4], [0; 4]);
+
+        // A second stream on the same slots reads the device, and writes nothing of the first one's.
+        let mut block = BufStream::with_slots(device, &mut slots);
+        let mut tmp = [0xFFu8; 4];
+        block.read_exact(&mut tmp).await.unwrap();
+        assert_eq!(tmp, [0; 4]);
+        block.flush().await.unwrap();
+        let device = block.into_inner();
+        // One read by each stream; the unflushed data of the first was never written.
+        assert_eq!((device.reads, device.writes), (2, 0));
     }
 }
