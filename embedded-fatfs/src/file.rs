@@ -139,6 +139,73 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
         }
     }
 
+    /// Allocate clusters past the end of the file until its cluster chain covers `len` bytes.
+    ///
+    /// The size and the position do not change, like `fallocate` with `FALLOC_FL_KEEP_SIZE`.
+    /// Later writes past the size go into the allocated clusters before new ones are allocated, so
+    /// a write that reaches a new cluster changes no FAT entry. The clusters are not zeroed. A
+    /// chain that already covers `len` is left as it is.
+    ///
+    /// Until the file is written to the end of its chain, the chain is longer than the size, which
+    /// a filesystem check reports as an error; an empty file gets a first cluster with size 0.
+    /// Release the clusters that were not written before you are done with the file: seek to the
+    /// end of the data (`SeekFrom::End(0)`) and call [`File::truncate`]. A power loss before that
+    /// leaves the extra clusters allocated to the file; writes after reopening it use them, and
+    /// truncating releases them.
+    ///
+    /// Preallocate through the handle that writes the file. Another handle opened on the same file
+    /// does not see the new chain while the file was empty, and its writes allocate a chain of
+    /// their own.
+    ///
+    /// The end of the chain is found by following it from the cluster at the current position, so
+    /// the FAT entries before the position are not read again.
+    ///
+    /// # Errors
+    ///
+    /// `Error::InvalidInput` for a directory, whose clusters must be zeroed, or for a `len` past
+    /// the largest file size; `Error::NotEnoughSpace` when the volume runs out of clusters,
+    /// keeping those allocated so far.
+    pub async fn preallocate(&mut self, len: u64) -> Result<(), Error<IO::Error>> {
+        trace!("File::preallocate {}", len);
+        if self.is_dir() {
+            return Err(Error::InvalidInput);
+        }
+        let Ok(len) = u32::try_from(len) else {
+            return Err(Error::InvalidInput);
+        };
+        let cluster_size = self.fs.cluster_size();
+        let wanted = len.div_ceil(cluster_size);
+        // The cluster at the position, and how many clusters of the chain end with it. At a
+        // cluster boundary the position's cluster is the one before the boundary.
+        let (mut last, mut count) = match self.context.current_cluster {
+            Some(current) => (Some(current), self.context.offset.div_ceil(cluster_size)),
+            None => (
+                self.context.first_cluster,
+                u32::from(self.context.first_cluster.is_some()),
+            ),
+        };
+        if let Some(start) = last {
+            let mut iter = self.fs.cluster_iter(start);
+            while let Some(cluster) = iter.next().await {
+                last = Some(cluster?);
+                count += 1;
+            }
+        }
+        if count < wanted {
+            // As for a write: the FAT is about to change.
+            self.fs.set_dirty_flag(true).await?;
+        }
+        while count < wanted {
+            let cluster = self.fs.alloc_cluster(last, false).await?;
+            if self.context.first_cluster.is_none() {
+                self.set_first_cluster(cluster);
+            }
+            last = Some(cluster);
+            count += 1;
+        }
+        Ok(())
+    }
+
     /// Get the extents of a file on disk.
     ///
     /// This returns an iterator over the byte ranges on-disk occupied by

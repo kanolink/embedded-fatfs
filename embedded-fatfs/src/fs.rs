@@ -596,6 +596,22 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         })
     }
 
+    /// Number of free clusters when it is known without reading the FAT: from the FS Information
+    /// Sector of a FAT32 volume that was mounted clean, or counted by an earlier
+    /// [`FileSystem::stats`], and kept up to date since. Like [`FileSystem::stats`], a count taken
+    /// from the FS Information Sector may be incorrect. `None` when [`FileSystem::stats`] would
+    /// have to count the whole FAT, which on a large volume takes seconds.
+    #[must_use]
+    pub fn free_clusters_hint(&self) -> Option<u32> {
+        self.fs_info.borrow().free_cluster_count
+    }
+
+    /// Number of clusters usable for file allocation.
+    #[must_use]
+    pub fn total_clusters(&self) -> u32 {
+        self.total_clusters
+    }
+
     /// Forces free clusters recalculation.
     async fn recalc_free_clusters(&self) -> Result<u32, Error<IO::Error>> {
         let mut fat = self.fat_slice();

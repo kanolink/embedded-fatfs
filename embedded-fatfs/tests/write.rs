@@ -721,6 +721,167 @@ async fn test_multiple_files_in_directory_fat32() {
     call_with_fs(&test_multiple_files_in_directory, FAT32_IMG, 8).await
 }
 
+async fn test_preallocate(fs: FileSystem) {
+    let root_dir = fs.root_dir();
+    let cluster_size = fs.cluster_size() as usize;
+    let before = fs.stats().await.unwrap().free_clusters();
+    let mut file = root_dir.create_file("prealloc.txt").await.unwrap();
+
+    // Allocates the clusters but keeps the size and the position.
+    file.preallocate((cluster_size * 3) as u64).await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.stats().await.unwrap().free_clusters(), before - 3);
+    assert_eq!(file.seek(SeekFrom::Current(0)).await.unwrap(), 0);
+    assert_eq!(file.seek(SeekFrom::End(0)).await.unwrap(), 0);
+
+    // Asking for less than the chain covers, or growing it, allocates only what is missing.
+    file.preallocate(1).await.unwrap();
+    file.preallocate((cluster_size * 4) as u64).await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.stats().await.unwrap().free_clusters(), before - 4);
+
+    // Writes go into the allocated clusters and allocate none.
+    let data = vec![b'a'; cluster_size * 2 + 1];
+    file.seek(SeekFrom::Start(0)).await.unwrap();
+    file.write_all(&data).await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.stats().await.unwrap().free_clusters(), before - 4);
+    assert_eq!(file.seek(SeekFrom::End(0)).await.unwrap(), data.len() as u64);
+
+    // The chain is counted from the position, inside a cluster or on a boundary.
+    file.preallocate((cluster_size * 4) as u64).await.unwrap();
+    file.seek(SeekFrom::Start(cluster_size as u64)).await.unwrap();
+    file.preallocate((cluster_size * 4) as u64).await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.stats().await.unwrap().free_clusters(), before - 4);
+    file.preallocate((cluster_size * 5) as u64).await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.stats().await.unwrap().free_clusters(), before - 5);
+    file.seek(SeekFrom::End(0)).await.unwrap();
+    file.truncate().await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.stats().await.unwrap().free_clusters(), before - 3);
+    file.preallocate((cluster_size * 4) as u64).await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.stats().await.unwrap().free_clusters(), before - 4);
+
+    // Truncating at the end of the data gives the unused clusters back.
+    file.truncate().await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.stats().await.unwrap().free_clusters(), before - 3);
+    file.close().await.unwrap();
+    let mut file = root_dir.open_file("prealloc.txt").await.unwrap();
+    assert_eq!(read_to_end(&mut file).await.unwrap(), data);
+    file.flush().await.unwrap();
+
+    // Asking for more than the volume has keeps what it got; truncating gives it back.
+    let free = fs.stats().await.unwrap().free_clusters();
+    let too_much = (cluster_size * (free as usize + 3 + 1)) as u64;
+    assert!(matches!(
+        file.preallocate(too_much).await,
+        Err(embedded_fatfs::Error::NotEnoughSpace)
+    ));
+    file.flush().await.unwrap();
+    assert_eq!(fs.stats().await.unwrap().free_clusters(), 0);
+    file.truncate().await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.stats().await.unwrap().free_clusters(), free);
+    file.seek(SeekFrom::Start(0)).await.unwrap();
+    assert_eq!(read_to_end(&mut file).await.unwrap(), data);
+}
+
+async fn test_free_clusters_hint(fs: FileSystem) {
+    // FAT12 and FAT16 have no FS Information Sector, so the count is not known until counted.
+    let hint = fs.free_clusters_hint();
+    let counted = fs.stats().await.unwrap().free_clusters();
+    match fs.fat_type() {
+        embedded_fatfs::FatType::Fat32 => assert_eq!(hint, Some(counted)),
+        _ => assert_eq!(hint, None),
+    }
+    assert_eq!(fs.free_clusters_hint(), Some(counted));
+    assert_eq!(fs.total_clusters(), fs.stats().await.unwrap().total_clusters());
+    // Allocation keeps the known count up to date.
+    let mut file = fs.root_dir().create_file("hint.txt").await.unwrap();
+    file.write_all(&vec![0; fs.cluster_size() as usize]).await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.free_clusters_hint(), Some(counted - 1));
+}
+
+#[tokio::test]
+async fn test_free_clusters_hint_fat12() {
+    call_with_fs(test_free_clusters_hint, FAT12_IMG, 14).await
+}
+
+#[tokio::test]
+async fn test_free_clusters_hint_fat16() {
+    call_with_fs(test_free_clusters_hint, FAT16_IMG, 14).await
+}
+
+#[tokio::test]
+async fn test_free_clusters_hint_fat32() {
+    call_with_fs(test_free_clusters_hint, FAT32_IMG, 14).await
+}
+
+async fn test_preallocate_edges(fs: FileSystem) {
+    let root_dir = fs.root_dir();
+    let cluster_size = fs.cluster_size() as usize;
+    let before = fs.stats().await.unwrap().free_clusters();
+
+    // An empty file truncated at 0 gives its preallocated chain back.
+    let mut file = root_dir.create_file("empty.txt").await.unwrap();
+    file.preallocate((cluster_size * 2) as u64).await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.stats().await.unwrap().free_clusters(), before - 2);
+    file.seek(SeekFrom::End(0)).await.unwrap();
+    file.truncate().await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.stats().await.unwrap().free_clusters(), before);
+
+    // A file reopened later, as after a power loss, appends into the clusters still allocated.
+    let data = vec![b'x'; cluster_size + 1];
+    let mut file = root_dir.create_file("reopen.txt").await.unwrap();
+    file.write_all(&data).await.unwrap();
+    file.preallocate((cluster_size * 4) as u64).await.unwrap();
+    file.close().await.unwrap();
+    assert_eq!(fs.stats().await.unwrap().free_clusters(), before - 4);
+    let mut file = root_dir.open_file("reopen.txt").await.unwrap();
+    file.seek(SeekFrom::End(0)).await.unwrap();
+    file.write_all(&vec![b'y'; cluster_size * 2]).await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.stats().await.unwrap().free_clusters(), before - 4);
+
+    // A length past the largest file size is refused.
+    assert!(matches!(
+        file.preallocate(u64::from(u32::MAX) + 1).await,
+        Err(embedded_fatfs::Error::InvalidInput)
+    ));
+}
+
+#[tokio::test]
+async fn test_preallocate_edges_fat12() {
+    call_with_fs(test_preallocate_edges, FAT12_IMG, 15).await
+}
+
+#[tokio::test]
+async fn test_preallocate_edges_fat32() {
+    call_with_fs(test_preallocate_edges, FAT32_IMG, 15).await
+}
+
+#[tokio::test]
+async fn test_preallocate_fat12() {
+    call_with_fs(test_preallocate, FAT12_IMG, 13).await
+}
+
+#[tokio::test]
+async fn test_preallocate_fat16() {
+    call_with_fs(test_preallocate, FAT16_IMG, 13).await
+}
+
+#[tokio::test]
+async fn test_preallocate_fat32() {
+    call_with_fs(test_preallocate, FAT32_IMG, 13).await
+}
+
 async fn read_to_end<IO: embedded_io_async::Read>(io: &mut IO) -> Result<Vec<u8>, IO::Error> {
     let mut buf = Vec::new();
     loop {
