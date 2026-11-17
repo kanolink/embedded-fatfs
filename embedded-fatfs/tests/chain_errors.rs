@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use embedded_fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
+use embedded_fatfs::{FatType, FileSystem, FormatVolumeOptions, FreeCountKind, FsOptions};
 use embedded_io_async::{ErrorKind, ErrorType, Read, Seek, SeekFrom, Write};
 
 /// In-memory volume whose reads fail while they cover the byte at `fail_at`.
@@ -141,6 +141,26 @@ async fn remove_with_failing_chain_read_deletes_the_entry_first() {
     ));
     assert_eq!(volume.entry(3), 0);
     assert_eq!(volume.entry(4), 5, "the rest of the chain is leaked, not freed");
+}
+
+#[tokio::test]
+async fn failing_chain_read_makes_the_free_count_an_estimate() {
+    let volume = Volume::new().await;
+    let fs = &volume.fs;
+    while !fs.count_free_clusters_step(1 << 20).await.unwrap() {}
+    let before = fs.free_clusters().unwrap();
+    assert_eq!(before.kind, FreeCountKind::Counted);
+
+    // Cluster 3 is freed before the read of cluster 4's entry fails, and the count misses it.
+    volume.fail_reads_of_entry(Some(4));
+    assert!(fs.root_dir().remove("LOG.TXT").await.is_err());
+    volume.fail_reads_of_entry(None);
+    assert_eq!(fs.free_clusters().map(|free| free.kind), Some(FreeCountKind::Estimate));
+
+    while !fs.count_free_clusters_step(1 << 20).await.unwrap() {}
+    let after = fs.free_clusters().unwrap();
+    assert_eq!(after.kind, FreeCountKind::Counted);
+    assert_eq!(after.count, before.count + 1);
 }
 
 #[tokio::test]

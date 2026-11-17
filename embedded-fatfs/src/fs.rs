@@ -18,7 +18,8 @@ use crate::error::Error;
 use crate::file::File;
 use crate::io::{self, IoBase, Read, ReadLeExt, Seek, SeekFrom, Write, WriteLeExt};
 use crate::table::{
-    alloc_cluster, count_free_clusters, format_fat, read_fat_flags, ClusterIterator, RESERVED_FAT_ENTRIES,
+    alloc_cluster, count_free_clusters, count_free_clusters_from, format_fat, read_fat_flags, ClusterIterator,
+    FreedClusters, RESERVED_FAT_ENTRIES,
 };
 use crate::time::{DefaultTimeProvider, TimeProvider};
 
@@ -143,6 +144,8 @@ pub(crate) const fn max_valid_cluster(total_clusters: u32) -> u32 {
 #[derive(Clone, Default, Debug)]
 struct FsInfoSector {
     free_cluster_count: Option<u32>,
+    /// Where `free_cluster_count` came from.
+    free_count_kind: FreeCountKind,
     next_free_cluster: Option<u32>,
     dirty: bool,
 }
@@ -188,6 +191,7 @@ impl FsInfoSector {
         }
         Ok(Self {
             free_cluster_count,
+            free_count_kind: FreeCountKind::Stored,
             next_free_cluster,
             dirty: false,
         })
@@ -198,7 +202,11 @@ impl FsInfoSector {
         let reserved = [0_u8; 480];
         wrt.write_all(&reserved).await?;
         wrt.write_u32_le(Self::STRUC_SIG).await?;
-        wrt.write_u32_le(self.free_cluster_count.unwrap_or(0xFFFF_FFFF)).await?;
+        // An estimate is not written back: another system reading it would take it as the count.
+        let free_cluster_count = self
+            .free_cluster_count
+            .filter(|_| self.free_count_kind != FreeCountKind::Estimate);
+        wrt.write_u32_le(free_cluster_count.unwrap_or(0xFFFF_FFFF)).await?;
         wrt.write_u32_le(self.next_free_cluster.unwrap_or(0xFFFF_FFFF)).await?;
         let reserved2 = [0_u8; 12];
         wrt.write_all(&reserved2).await?;
@@ -232,7 +240,8 @@ impl FsInfoSector {
     fn map_free_clusters(&mut self, map_fn: impl Fn(u32) -> u32) {
         if let Some(n) = self.free_cluster_count {
             self.free_cluster_count = Some(map_fn(n));
-            self.dirty = true;
+            // An estimate is not written back, so it does not make the sector dirty.
+            self.dirty |= self.free_count_kind != FreeCountKind::Estimate;
         }
     }
 
@@ -243,7 +252,20 @@ impl FsInfoSector {
 
     fn set_free_cluster_count(&mut self, free_cluster_count: u32) {
         self.free_cluster_count = Some(free_cluster_count);
+        self.free_count_kind = FreeCountKind::Counted;
         self.dirty = true;
+    }
+
+    /// The free cluster count unless it is an estimate.
+    fn trusted_free_clusters(&self) -> Option<u32> {
+        self.free_cluster_count
+            .filter(|_| self.free_count_kind != FreeCountKind::Estimate)
+    }
+
+    /// The free cluster count when it was counted on this mount.
+    fn counted_free_clusters(&self) -> Option<u32> {
+        self.free_cluster_count
+            .filter(|_| self.free_count_kind == FreeCountKind::Counted)
     }
 }
 
@@ -339,6 +361,41 @@ pub struct FileSystem<IO: Read + Write + Seek, TP, OCC> {
     total_clusters: u32,
     fs_info: RefCell<FsInfoSector>,
     current_status_flags: Cell<FsStatusFlags>,
+    /// Progress of a free cluster count made in steps by [`FileSystem::count_free_clusters_step`].
+    free_count: Cell<Option<FreeCount>>,
+}
+
+/// A free cluster count in progress: the entries below `next` have been counted.
+#[derive(Clone, Copy, Debug)]
+struct FreeCount {
+    next: u32,
+    free: u32,
+}
+
+/// Where a free cluster count came from. Whatever its source, the count is kept up to date by every
+/// allocation and free since.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FreeCountKind {
+    /// Read from the FS Information Sector of a volume that was not unmounted cleanly: changes
+    /// made after the sector was last written are missing, so it may be wrong by any amount.
+    Estimate,
+    /// Read from the FS Information Sector of a volume that was unmounted cleanly. Usually
+    /// right, but another system may have changed the volume without updating the sector.
+    #[default]
+    Stored,
+    /// Counted from the FAT on this mount.
+    Counted,
+}
+
+/// The number of free clusters as far as it is known without reading the FAT.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FreeClusters {
+    /// Number of free clusters.
+    pub count: u32,
+    /// Where the count came from.
+    pub kind: FreeCountKind,
 }
 
 /// The underlying storage device
@@ -409,9 +466,10 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             FsInfoSector::default()
         };
 
-        // if dirty flag is set completly ignore free_cluster_count in FSInfo
+        // A volume that was not unmounted cleanly may have changed since the FSInfo count was written; keep the count
+        // only as an estimate, which is never written back and never used to refuse an allocation.
         if bpb.status_flags().dirty {
-            fs_info.free_cluster_count = None;
+            fs_info.free_count_kind = FreeCountKind::Estimate;
         }
 
         // Validate the numbers stored in the free_cluster_count and next_free_cluster are within bounds for volume
@@ -430,6 +488,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             total_clusters,
             fs_info: RefCell::new(fs_info),
             current_status_flags: Cell::new(status_flags),
+            free_count: Cell::new(None),
         })
     }
 
@@ -527,22 +586,65 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
 
     pub(crate) async fn truncate_cluster_chain(&self, cluster: u32) -> Result<(), Error<IO::Error>> {
         let mut iter = self.cluster_iter(cluster);
-        let num_free = iter.truncate().await?;
-        let mut fs_info = self.fs_info.borrow_mut();
-        fs_info.map_free_clusters(|n| n + num_free);
+        let freed = iter
+            .truncate(self.free_count_next())
+            .await
+            .inspect_err(|_| self.distrust_free_count())?;
+        self.note_freed(freed);
         Ok(())
     }
 
     pub(crate) async fn free_cluster_chain(&self, cluster: u32) -> Result<(), Error<IO::Error>> {
         let mut iter = self.cluster_iter(cluster);
-        let num_free = iter.free().await?;
-        let mut fs_info = self.fs_info.borrow_mut();
-        fs_info.map_free_clusters(|n| n + num_free);
+        let freed = iter
+            .free(self.free_count_next())
+            .await
+            .inspect_err(|_| self.distrust_free_count())?;
+        self.note_freed(freed);
         Ok(())
+    }
+
+    /// A chain was freed only in part: how many clusters were freed before the error is not known,
+    /// so the free cluster count becomes an estimate, too low, and a count in progress starts over.
+    /// A count too low that reached 0 would refuse every allocation.
+    fn distrust_free_count(&self) {
+        self.free_count.set(None);
+        let mut fs_info = self.fs_info.borrow_mut();
+        if fs_info.free_cluster_count.is_some() {
+            fs_info.free_count_kind = FreeCountKind::Estimate;
+        }
+    }
+
+    /// The cluster a free cluster count in progress continues at; 0 when none is in progress.
+    fn free_count_next(&self) -> u32 {
+        self.free_count.get().map_or(0, |count| count.next)
+    }
+
+    /// Updates the free cluster counts after a chain was freed, and moves the next free cluster
+    /// hint back to the lowest cluster freed: left past it, the next allocation searches the
+    /// allocated clusters after the hint first, then the FAT from its start.
+    fn note_freed(&self, freed: FreedClusters) {
+        let total_clusters = self.total_clusters;
+        let mut fs_info = self.fs_info.borrow_mut();
+        fs_info.map_free_clusters(|n| cmp::min(n.saturating_add(freed.count), total_clusters));
+        if let Some(lowest) = freed.lowest {
+            if fs_info.next_free_cluster.map_or(true, |hint| lowest < hint) {
+                fs_info.set_next_free_cluster(lowest);
+            }
+        }
+        if let Some(mut count) = self.free_count.get() {
+            count.free += freed.below;
+            self.free_count.set(Some(count));
+        }
     }
 
     pub(crate) async fn alloc_cluster(&self, prev_cluster: Option<u32>, zero: bool) -> Result<u32, Error<IO::Error>> {
         trace!("alloc_cluster");
+        // A volume counted full on this mount is not searched: on a large volume that reads the whole FAT. A stored
+        // count is not trusted for this; one that is wrong would refuse every allocation.
+        if self.fs_info.borrow().counted_free_clusters() == Some(0) {
+            return Err(Error::NotEnoughSpace);
+        }
         let hint = self.fs_info.borrow().next_free_cluster;
         let cluster = {
             let mut fat = self.fat_slice();
@@ -556,7 +658,13 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         }
         let mut fs_info = self.fs_info.borrow_mut();
         fs_info.set_next_free_cluster(cluster + 1);
-        fs_info.map_free_clusters(|n| n - 1);
+        fs_info.map_free_clusters(|n| n.saturating_sub(1));
+        if let Some(mut count) = self.free_count.get() {
+            if cluster < count.next {
+                count.free = count.free.saturating_sub(1);
+                self.free_count.set(Some(count));
+            }
+        }
         Ok(cluster)
     }
 
@@ -583,7 +691,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     ///
     /// `Error::Io` will be returned if the underlying storage object returned an I/O error.
     pub async fn stats(&self) -> Result<FileSystemStats, Error<IO::Error>> {
-        let free_clusters_option = self.fs_info.borrow().free_cluster_count;
+        let free_clusters_option = self.fs_info.borrow().trusted_free_clusters();
         let free_clusters = if let Some(n) = free_clusters_option {
             n
         } else {
@@ -596,14 +704,52 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         })
     }
 
-    /// Number of free clusters when it is known without reading the FAT: from the FS Information
-    /// Sector of a FAT32 volume that was mounted clean, or counted by an earlier
-    /// [`FileSystem::stats`], and kept up to date since. Like [`FileSystem::stats`], a count taken
-    /// from the FS Information Sector may be incorrect. `None` when [`FileSystem::stats`] would
-    /// have to count the whole FAT, which on a large volume takes seconds.
+    /// Number of free clusters as far as it is known without reading the FAT: from the FS
+    /// Information Sector of a FAT32 volume, or counted by [`FileSystem::stats`] or
+    /// [`FileSystem::count_free_clusters_step`], and kept up to date since; see
+    /// [`FreeCountKind`]. `None` when there is no count at all.
     #[must_use]
-    pub fn free_clusters_hint(&self) -> Option<u32> {
-        self.fs_info.borrow().free_cluster_count
+    pub fn free_clusters(&self) -> Option<FreeClusters> {
+        let fs_info = self.fs_info.borrow();
+        fs_info.free_cluster_count.map(|count| FreeClusters {
+            count,
+            kind: fs_info.free_count_kind,
+        })
+    }
+
+    /// Counts free clusters in the FAT, at most `max_clusters` entries per call, so a caller can
+    /// count a large FAT a little at a time between other work: counting all of it takes seconds.
+    /// Clusters allocated and freed between calls are counted correctly. Returns `true` once the
+    /// count is complete: [`FileSystem::free_clusters`] is then [`FreeCountKind::Counted`], and
+    /// the count is kept up to date and written to the FS Information Sector. Does nothing and
+    /// returns `true` when the count was counted on this mount already. On FAT12 and FAT16 one
+    /// call counts the whole FAT.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Io` will be returned if the underlying storage object returned an I/O error.
+    pub async fn count_free_clusters_step(&self, max_clusters: u32) -> Result<bool, Error<IO::Error>> {
+        if self.fs_info.borrow().counted_free_clusters().is_some() {
+            self.free_count.set(None);
+            return Ok(true);
+        }
+        let count = self.free_count.get().unwrap_or(FreeCount {
+            next: RESERVED_FAT_ENTRIES,
+            free: 0,
+        });
+        let end = count.next.saturating_add(cmp::max(max_clusters, 1));
+        let (free, next) = {
+            let mut fat = self.fat_slice();
+            count_free_clusters_from(&mut fat, self.fat_type, count.next, end, self.total_clusters).await?
+        };
+        let free = count.free + free;
+        if next >= self.total_clusters + RESERVED_FAT_ENTRIES {
+            self.free_count.set(None);
+            self.fs_info.borrow_mut().set_free_cluster_count(free);
+            return Ok(true);
+        }
+        self.free_count.set(Some(FreeCount { next, free }));
+        Ok(false)
     }
 
     /// Number of clusters usable for file allocation.
@@ -616,6 +762,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     async fn recalc_free_clusters(&self) -> Result<u32, Error<IO::Error>> {
         let mut fat = self.fat_slice();
         let free_cluster_count = count_free_clusters(&mut fat, self.fat_type, self.total_clusters).await?;
+        self.free_count.set(None);
         self.fs_info.borrow_mut().set_free_cluster_count(free_cluster_count);
         Ok(free_cluster_count)
     }
@@ -1260,6 +1407,7 @@ pub async fn format_volume<S: ReadWriteSeek>(
         // FSInfo sector
         let fs_info_sector = FsInfoSector {
             free_cluster_count: None,
+            free_count_kind: FreeCountKind::Stored,
             next_free_cluster: None,
             dirty: false,
         };

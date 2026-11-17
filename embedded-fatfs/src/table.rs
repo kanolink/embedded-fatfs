@@ -203,6 +203,60 @@ where
     }
 }
 
+/// Counts the free entries of a FAT32 table from `start_cluster` up to `end_cluster`, reading
+/// several entries at a time: one read per entry makes a count of a large table take tens of
+/// seconds.
+async fn count_free_fat32<S, E>(fat: &mut S, start_cluster: u32, end_cluster: u32) -> Result<u32, Error<E>>
+where
+    S: Read + Seek,
+    E: IoError,
+    Error<E>: From<S::Error> + From<ReadExactError<S::Error>>,
+{
+    const ENTRIES: u32 = 32;
+    let mut entries = [0_u8; ENTRIES as usize * 4];
+    let mut count = 0;
+    let mut cluster = start_cluster;
+    fat.seek(io::SeekFrom::Start(u64::from(cluster) * 4)).await?;
+    while cluster < end_cluster {
+        // Reads stay within one sector of the table.
+        let len = cmp::min(ENTRIES - cluster % ENTRIES, end_cluster - cluster);
+        let bytes = &mut entries[..len as usize * 4];
+        fat.read_exact(bytes).await?;
+        count += bytes
+            .chunks_exact(4)
+            .filter(|entry| u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) & 0x0FFF_FFFF == 0)
+            .count() as u32;
+        cluster += len;
+    }
+    Ok(count)
+}
+
+/// Counts the free entries from `start_cluster` up to `end_cluster` and returns the count and the
+/// cluster the count stopped at. Only a FAT32 count stops at `end_cluster`; a FAT12 or FAT16 table
+/// is small, so its count always runs to the end of the table.
+pub(crate) async fn count_free_clusters_from<S, E>(
+    fat: &mut S,
+    fat_type: FatType,
+    start_cluster: u32,
+    end_cluster: u32,
+    total_clusters: u32,
+) -> Result<(u32, u32), Error<E>>
+where
+    S: Read + Seek,
+    E: IoError,
+    Error<E>: From<S::Error> + From<ReadExactError<S::Error>>,
+{
+    let table_end = total_clusters + RESERVED_FAT_ENTRIES;
+    match fat_type {
+        FatType::Fat32 => {
+            let end_cluster = cmp::min(end_cluster, table_end);
+            let count = count_free_fat32(fat, start_cluster, end_cluster).await?;
+            Ok((count, end_cluster))
+        }
+        _ => Ok((count_free_clusters(fat, fat_type, total_clusters).await?, table_end)),
+    }
+}
+
 pub(crate) async fn format_fat<S, E>(
     fat: &mut S,
     fat_type: FatType,
@@ -568,17 +622,7 @@ impl FatTrait for Fat32 {
         E: IoError,
         Error<E>: From<S::Error> + From<ReadExactError<S::Error>>,
     {
-        let mut count = 0;
-        let mut cluster = RESERVED_FAT_ENTRIES;
-        fat.seek(io::SeekFrom::Start(u64::from(cluster * 4))).await?;
-        while cluster < end_cluster {
-            let val = fat.read_u32_le().await? & 0x0FFF_FFFF;
-            if val == 0 {
-                count += 1;
-            }
-            cluster += 1;
-        }
-        Ok(count)
+        count_free_fat32(fat, RESERVED_FAT_ENTRIES, end_cluster).await
     }
 
     async fn set_raw<S, E>(fat: &mut S, cluster: u32, raw_value: u32) -> Result<(), Error<E>>
@@ -591,6 +635,17 @@ impl FatTrait for Fat32 {
         fat.write_u32_le(raw_value).await?;
         Ok(())
     }
+}
+
+/// Clusters a [`ClusterIterator::free`] or [`ClusterIterator::truncate`] freed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FreedClusters {
+    /// Number of clusters freed.
+    pub(crate) count: u32,
+    /// Number of them below the cluster number given to the call.
+    pub(crate) below: u32,
+    /// Lowest cluster number freed.
+    pub(crate) lowest: Option<u32>,
 }
 
 pub(crate) struct ClusterIterator<B, E, S = B> {
@@ -621,7 +676,8 @@ where
         }
     }
 
-    pub(crate) async fn truncate(&mut self) -> Result<u32, Error<E>> {
+    /// Ends the chain at the current cluster and frees the rest; see [`ClusterIterator::free`].
+    pub(crate) async fn truncate(&mut self, below: u32) -> Result<FreedClusters, Error<E>> {
         if let Some(n) = self.cluster {
             // Move to the next cluster. On a read error the iterator stops without moving, so
             // return the error instead of changing a chain whose rest is unknown.
@@ -631,23 +687,29 @@ where
             // Mark previous cluster as end of chain
             write_fat(self.fat.borrow_mut(), self.fat_type, n, FatValue::EndOfChain).await?;
             // Free rest of chain
-            self.free().await
+            self.free(below).await
         } else {
-            Ok(0)
+            Ok(FreedClusters::default())
         }
     }
 
-    pub(crate) async fn free(&mut self) -> Result<u32, Error<E>> {
-        let mut num_free = 0;
+    /// Frees the chain from the current cluster on. Counts the clusters it freed, and of them the
+    /// ones numbered below `below`. On an error the clusters freed before it are not reported.
+    pub(crate) async fn free(&mut self, below: u32) -> Result<FreedClusters, Error<E>> {
+        let mut freed = FreedClusters::default();
         while let Some(n) = self.cluster {
             // A read error leaves `self.cluster` unchanged; freeing it again would loop forever.
             if let Some(Err(err)) = self.next().await {
                 return Err(err);
             }
             write_fat(self.fat.borrow_mut(), self.fat_type, n, FatValue::Free).await?;
-            num_free += 1;
+            freed.count += 1;
+            if n < below {
+                freed.below += 1;
+            }
+            freed.lowest = Some(freed.lowest.map_or(n, |lowest| cmp::min(lowest, n)));
         }
-        Ok(num_free)
+        Ok(freed)
     }
 
     pub async fn next(&mut self) -> Option<Result<u32, Error<E>>> {
@@ -694,6 +756,20 @@ mod tests {
         assert!(find_free_cluster(&mut cur, fat_type, 0x13, 0x14).await.is_err());
 
         assert_eq!(count_free_clusters(&mut cur, fat_type, 0x1E).await.ok(), Some(5));
+        // A FAT32 count stops where asked; the others always count the whole table.
+        let first = count_free_clusters_from(&mut cur, fat_type, 2, 0x13, 0x1E).await.ok();
+        match fat_type {
+            FatType::Fat32 => {
+                assert_eq!(first, Some((1, 0x13)));
+                assert_eq!(
+                    count_free_clusters_from(&mut cur, fat_type, 0x13, 0x40, 0x1E)
+                        .await
+                        .ok(),
+                    Some((4, 0x20))
+                );
+            }
+            _ => assert_eq!(first, Some((5, 0x20))),
+        }
 
         // test allocation
         assert_eq!(
@@ -743,7 +819,7 @@ mod tests {
             iter.next().await;
             let value = iter.next().await.unwrap().ok();
             assert_eq!(value, Some(0x16));
-            assert!(iter.truncate().await.is_ok());
+            assert!(iter.truncate(0).await.is_ok());
         }
         assert_eq!(
             read_fat(&mut cur, fat_type, 0x16).await.ok(),
@@ -754,7 +830,14 @@ mod tests {
         // test freeing a chain
         {
             let mut iter = ClusterIterator::<&mut S, S::Error, S>::new(&mut cur, fat_type, 0x9);
-            assert!(iter.free().await.is_ok());
+            assert_eq!(
+                iter.free(0x14).await.ok(),
+                Some(FreedClusters {
+                    count: 5,
+                    below: 2,
+                    lowest: Some(0x9)
+                })
+            );
         }
         assert_eq!(read_fat(&mut cur, fat_type, 0x9).await.ok(), Some(FatValue::Free));
         assert_eq!(read_fat(&mut cur, fat_type, 0xA).await.ok(), Some(FatValue::Free));
@@ -858,7 +941,7 @@ mod tests {
         storage.fail_reads = 1;
         {
             let mut iter = ClusterIterator::<&mut S, std::io::Error, S>::new(&mut storage, FatType::Fat32, 0x9);
-            assert!(iter.free().await.is_err());
+            assert!(iter.free(0).await.is_err());
         }
         assert_eq!(
             read_fat(&mut storage, FatType::Fat32, 0x9).await.ok(),
@@ -873,7 +956,7 @@ mod tests {
         storage.fail_reads = 1;
         {
             let mut iter = ClusterIterator::<&mut S, std::io::Error, S>::new(&mut storage, FatType::Fat32, 0x9);
-            assert!(iter.truncate().await.is_err());
+            assert!(iter.truncate(0).await.is_err());
         }
         assert_eq!(
             read_fat(&mut storage, FatType::Fat32, 0x9).await.ok(),
@@ -889,7 +972,7 @@ mod tests {
         storage.inner.write_all(&1_u32.to_le_bytes()).await.unwrap();
         {
             let mut iter = ClusterIterator::<&mut S, std::io::Error, S>::new(&mut storage, FatType::Fat32, 0x9);
-            assert!(matches!(iter.free().await, Err(Error::CorruptedFileSystem)));
+            assert!(matches!(iter.free(0).await, Err(Error::CorruptedFileSystem)));
         }
         assert_eq!(
             read_fat(&mut storage, FatType::Fat32, 0x9).await.ok(),

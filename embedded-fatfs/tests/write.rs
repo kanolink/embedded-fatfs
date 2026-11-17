@@ -2,7 +2,7 @@ use std::future::Future;
 use std::str;
 use tokio::fs;
 
-use embedded_fatfs::{ChronoTimeProvider, FsOptions, LossyOemCpConverter};
+use embedded_fatfs::{ChronoTimeProvider, FreeCountKind, FsOptions, LossyOemCpConverter};
 use embedded_io_async::{Seek, SeekFrom, Write};
 
 const FAT12_IMG: &str = "fat12.img";
@@ -790,36 +790,139 @@ async fn test_preallocate(fs: FileSystem) {
     assert_eq!(read_to_end(&mut file).await.unwrap(), data);
 }
 
-async fn test_free_clusters_hint(fs: FileSystem) {
+async fn test_free_clusters(fs: FileSystem) {
     // FAT12 and FAT16 have no FS Information Sector, so the count is not known until counted.
-    let hint = fs.free_clusters_hint();
+    let known = fs.free_clusters();
     let counted = fs.stats().await.unwrap().free_clusters();
+    let free = |count, kind| Some(embedded_fatfs::FreeClusters { count, kind });
+    // A stored count is trusted by stats(), but only a count made on this mount is "counted".
+    let kind = match fs.fat_type() {
+        embedded_fatfs::FatType::Fat32 => FreeCountKind::Stored,
+        _ => FreeCountKind::Counted,
+    };
     match fs.fat_type() {
-        embedded_fatfs::FatType::Fat32 => assert_eq!(hint, Some(counted)),
-        _ => assert_eq!(hint, None),
+        embedded_fatfs::FatType::Fat32 => assert_eq!(known, free(counted, kind)),
+        _ => assert_eq!(known, None),
     }
-    assert_eq!(fs.free_clusters_hint(), Some(counted));
+    assert_eq!(fs.free_clusters(), free(counted, kind));
     assert_eq!(fs.total_clusters(), fs.stats().await.unwrap().total_clusters());
     // Allocation keeps the known count up to date.
     let mut file = fs.root_dir().create_file("hint.txt").await.unwrap();
     file.write_all(&vec![0; fs.cluster_size() as usize]).await.unwrap();
     file.flush().await.unwrap();
-    assert_eq!(fs.free_clusters_hint(), Some(counted - 1));
+    assert_eq!(fs.free_clusters(), free(counted - 1, kind));
+    while !fs.count_free_clusters_step(1 << 20).await.unwrap() {}
+    assert_eq!(fs.free_clusters(), free(counted - 1, FreeCountKind::Counted));
 }
 
 #[tokio::test]
-async fn test_free_clusters_hint_fat12() {
-    call_with_fs(test_free_clusters_hint, FAT12_IMG, 14).await
+async fn test_free_clusters_fat12() {
+    call_with_fs(test_free_clusters, FAT12_IMG, 14).await
 }
 
 #[tokio::test]
-async fn test_free_clusters_hint_fat16() {
-    call_with_fs(test_free_clusters_hint, FAT16_IMG, 14).await
+async fn test_free_clusters_fat16() {
+    call_with_fs(test_free_clusters, FAT16_IMG, 14).await
 }
 
 #[tokio::test]
-async fn test_free_clusters_hint_fat32() {
-    call_with_fs(test_free_clusters_hint, FAT32_IMG, 14).await
+async fn test_free_clusters_fat32() {
+    call_with_fs(test_free_clusters, FAT32_IMG, 14).await
+}
+
+async fn write_clusters(fs: &FileSystem, name: &str, clusters: usize) {
+    let mut file = fs.root_dir().create_file(name).await.unwrap();
+    file.write_all(&vec![b'x'; fs.cluster_size() as usize * clusters])
+        .await
+        .unwrap();
+    file.flush().await.unwrap();
+}
+
+async fn test_free_count_steps(tmp_path: String) {
+    // A volume left without an unmount: its FS Information Sector still holds the count from
+    // before the file was written.
+    let fs = open_filesystem_rw(tmp_path.clone()).await;
+    let before = fs.stats().await.unwrap().free_clusters();
+    fs.flush().await.unwrap();
+    write_clusters(&fs, "a.txt", 3).await;
+    drop(fs);
+
+    let fs = open_filesystem_rw(tmp_path.clone()).await;
+    let fat32 = fs.fat_type() == embedded_fatfs::FatType::Fat32;
+    let estimate = fat32.then_some(embedded_fatfs::FreeClusters {
+        count: before,
+        kind: FreeCountKind::Estimate,
+    });
+    assert_eq!(fs.free_clusters(), estimate);
+
+    // Clusters allocated and freed between steps, on both sides of where the count stopped.
+    let mut steps = 1;
+    let mut done = fs.count_free_clusters_step(16).await.unwrap();
+    assert_eq!(done, !fat32);
+    write_clusters(&fs, "b.txt", 2).await;
+    fs.root_dir().remove("a.txt").await.unwrap();
+    while !done {
+        done = fs.count_free_clusters_step(16).await.unwrap();
+        steps += 1;
+    }
+    assert!(!fat32 || steps > 2);
+    let exact = Some(embedded_fatfs::FreeClusters {
+        count: before - 2,
+        kind: FreeCountKind::Counted,
+    });
+    assert_eq!(fs.free_clusters(), exact);
+    assert!(fs.count_free_clusters_step(16).await.unwrap());
+
+    // The counted count is written back. A volume mounted dirty stays dirty, so the next mount
+    // takes it as an estimate again, and a count from scratch agrees.
+    fs.unmount().await.unwrap();
+    let fs = open_filesystem_rw(tmp_path).await;
+    if fat32 {
+        let estimate = Some(embedded_fatfs::FreeClusters {
+            count: before - 2,
+            kind: FreeCountKind::Estimate,
+        });
+        assert_eq!(fs.free_clusters(), estimate);
+    }
+    while !fs.count_free_clusters_step(1 << 20).await.unwrap() {}
+    assert_eq!(fs.free_clusters(), exact);
+}
+
+#[tokio::test]
+async fn test_free_count_steps_fat12() {
+    call_with_tmp_img(test_free_count_steps, FAT12_IMG, 16).await
+}
+
+#[tokio::test]
+async fn test_free_count_steps_fat32() {
+    call_with_tmp_img(test_free_count_steps, FAT32_IMG, 16).await
+}
+
+async fn test_full_volume(fs: FileSystem) {
+    let cluster_size = fs.cluster_size() as usize;
+    while !fs.count_free_clusters_step(1 << 20).await.unwrap() {}
+    let free = fs.stats().await.unwrap().free_clusters() as usize;
+    let mut file = fs.root_dir().create_file("full.txt").await.unwrap();
+    file.write_all(&vec![b'x'; cluster_size * free]).await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.free_clusters().map(|free| free.count), Some(0));
+    assert!(matches!(
+        file.write_all(&[b'y']).await,
+        Err(embedded_fatfs::Error::NotEnoughSpace)
+    ));
+    // Space freed by a truncate is found again, at clusters before the next free cluster hint.
+    file.seek(SeekFrom::Start(0)).await.unwrap();
+    file.truncate().await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.free_clusters().map(|free| free.count), Some(free as u32));
+    file.write_all(&vec![b'z'; cluster_size]).await.unwrap();
+    file.flush().await.unwrap();
+    assert_eq!(fs.free_clusters().map(|free| free.count), Some(free as u32 - 1));
+}
+
+#[tokio::test]
+async fn test_full_volume_fat12() {
+    call_with_fs(test_full_volume, FAT12_IMG, 17).await
 }
 
 async fn test_preallocate_edges(fs: FileSystem) {
