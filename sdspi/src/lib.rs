@@ -356,6 +356,9 @@ where
         Ok(self.card.ok_or(Error::NotInitialized)?.size())
     }
 
+    /// Reads one data block. CS is released between polling for the start token and reading the
+    /// block, which SD Part 1 §7.2 does not allow. Fixing this needs a bounded wait, so it is a
+    /// known gap and not covered by the command/response CS change.
     async fn read_data(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
         let r = with_timeout(self.delay.clone(), 1000, self.poll_byte(|b| b != 0xFF)).await??;
 
