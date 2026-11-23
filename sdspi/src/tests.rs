@@ -140,18 +140,18 @@ fn push_cmd_resp(script: &mut Vec<u8>, wait_idle: bool, ncr: usize, r1: u8, extr
 
 #[test]
 fn stuck_busy_times_out() {
-    assert_eq!(read(&mut driver(&[], 0x00)), Err(Error::Timeout));
+    assert_eq!(read(&mut driver(&[], 0x00)), Err(Error::BusyTimeout));
 }
 
 #[test]
 fn removed_card_times_out_waiting_for_r1() {
-    assert_eq!(read(&mut driver(&[], 0xFF)), Err(Error::Timeout));
+    assert_eq!(read(&mut driver(&[], 0xFF)), Err(Error::NoResponse));
 }
 
 #[test]
 fn removed_card_times_out_waiting_for_read_token() {
     // Idle before CMD17, R1 ready, then 0xFF forever.
-    assert_eq!(read(&mut driver(&[0xFF, 0x00], 0xFF)), Err(Error::Timeout));
+    assert_eq!(read(&mut driver(&[0xFF, 0x00], 0xFF)), Err(Error::ReadTimeout));
 }
 
 #[test]
@@ -238,6 +238,28 @@ fn acmd41_r1_error_fails_fast() {
         block_on(drv.init()),
         Err(Error::RegisterError(R1_IDLE_STATE | R1_ILLEGAL_COMMAND))
     );
+}
+
+#[test]
+fn silent_card_init_reports_no_response() {
+    let mut drv = uninit_driver(&[], 0xFF);
+    assert_eq!(block_on(drv.init()), Err(Error::NoResponse));
+}
+
+#[test]
+fn acmd41_stuck_idle_reports_busy_timeout() {
+    let mut script = Vec::new();
+    push_cmd_resp(&mut script, false, 1, R1_IDLE_STATE, &[], 10);
+    push_cmd_resp(&mut script, true, 1, R1_IDLE_STATE, &[0x00, 0x00, 0x01, 0xAA], 14);
+    push_cmd_resp(&mut script, true, 1, R1_IDLE_STATE, &[], 10);
+    // CMD55 + ACMD41 keep answering "still initializing" until the stage limit runs out.
+    for _ in 0..16 {
+        push_cmd_resp(&mut script, true, 1, R1_IDLE_STATE, &[], 10);
+        push_cmd_resp(&mut script, true, 1, R1_IDLE_STATE, &[], 10);
+    }
+
+    let mut drv = uninit_driver(&script, 0xFF);
+    assert_eq!(block_on(drv.init()), Err(Error::BusyTimeout));
 }
 
 #[test]
