@@ -30,6 +30,9 @@ pub struct FileContext {
     pub(crate) first_cluster: Option<u32>,
     // Note: if offset points between clusters current_cluster is the previous cluster
     pub(crate) current_cluster: Option<u32>,
+    // The cluster before current_cluster in the chain, when known. A seek back into it, such as a
+    // rewrite from the start of the current cluster, then needs no walk from the first cluster.
+    pub(crate) previous_cluster: Option<u32>,
     // current position in this file
     pub(crate) offset: u32,
     // file dir entry editor - None for root dir
@@ -59,6 +62,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
                 first_cluster,
                 entry,
                 current_cluster: None, // cluster before first one
+                previous_cluster: None,
                 offset: 0,
             },
             fs,
@@ -368,6 +372,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
         Ok(FileContext {
             first_cluster: self.context.first_cluster,
             current_cluster: self.context.current_cluster,
+            previous_cluster: self.context.previous_cluster,
             offset: self.context.offset,
             entry: self.context.entry.clone(),
         })
@@ -406,7 +411,8 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         trace!("File::read");
         let cluster_size = self.fs.cluster_size();
-        let current_cluster_opt = if self.context.offset % cluster_size == 0 {
+        let at_boundary = self.context.offset % cluster_size == 0;
+        let current_cluster_opt = if at_boundary {
             // next cluster
             match self.context.current_cluster {
                 None => self.context.first_cluster,
@@ -444,6 +450,9 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
             return Ok(0);
         }
         self.context.offset += read_bytes as u32;
+        if at_boundary {
+            self.context.previous_cluster = self.context.current_cluster;
+        }
         self.context.current_cluster = Some(current_cluster);
 
         if let Some(ref mut e) = self.context.entry {
@@ -478,7 +487,8 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
         // Mark the volume 'dirty'
         self.fs.set_dirty_flag(true).await?;
         // Get cluster for write possibly allocating new one
-        let current_cluster = if self.context.offset % cluster_size == 0 {
+        let at_boundary = self.context.offset % cluster_size == 0;
+        let current_cluster = if at_boundary {
             // next cluster
             let next_cluster = match self.context.current_cluster {
                 None => self.context.first_cluster,
@@ -524,6 +534,9 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
         }
         // some bytes were writter - update position and optionally size
         self.context.offset += written_bytes as u32;
+        if at_boundary {
+            self.context.previous_cluster = self.context.current_cluster;
+        }
         self.context.current_cluster = Some(current_cluster);
         self.update_dir_entry_after_write();
         Ok(written_bytes)
@@ -571,35 +584,43 @@ impl<IO: ReadWriteSeek, TP, OCC> Seek for File<'_, IO, TP, OCC> {
         }
         let new_offset_in_clusters = self.fs.clusters_from_bytes(u64::from(new_offset));
         let old_offset_in_clusters = self.fs.clusters_from_bytes(u64::from(self.context.offset));
-        let new_cluster = if new_offset == 0 {
-            None
+        let (new_cluster, previous_cluster) = if new_offset == 0 {
+            (None, None)
         } else if new_offset_in_clusters == old_offset_in_clusters {
-            self.context.current_cluster
+            (self.context.current_cluster, self.context.previous_cluster)
+        } else if new_offset_in_clusters + 1 == old_offset_in_clusters && self.context.previous_cluster.is_some() {
+            // back into the cluster before the current one, for example to the boundary at the
+            // start of the current cluster
+            (self.context.previous_cluster, None)
         } else if let Some(first_cluster) = self.context.first_cluster {
             // calculate number of clusters to skip
             // return the previous cluster if the offset points to the cluster boundary
             // Note: new_offset_in_clusters cannot be 0 here because new_offset is not 0
             debug_assert!(new_offset_in_clusters > 0);
             let clusters_to_skip = new_offset_in_clusters - 1;
+            let mut previous = None;
             let mut cluster = first_cluster;
             let mut iter = self.fs.cluster_iter(first_cluster);
             for i in 0..clusters_to_skip {
-                cluster = if let Some(r) = iter.next().await {
+                let next = if let Some(r) = iter.next().await {
                     r?
                 } else {
                     // cluster chain ends before the new position - seek to the end of the last cluster
                     new_offset = self.fs.bytes_from_clusters(i + 1) as u32;
                     break;
                 };
+                previous = Some(cluster);
+                cluster = next;
             }
-            Some(cluster)
+            (Some(cluster), previous)
         } else {
             // empty file - always seek to 0
             new_offset = 0;
-            None
+            (None, None)
         };
         self.context.offset = new_offset;
         self.context.current_cluster = new_cluster;
+        self.context.previous_cluster = previous_cluster;
         Ok(u64::from(self.context.offset))
     }
 }
