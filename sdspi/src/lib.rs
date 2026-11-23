@@ -62,15 +62,32 @@ impl Card {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error {
+    /// The chip-select pin could not be driven.
     ChipSelect,
+    /// The SPI bus reported a transfer error.
     SpiError,
-    Timeout,
+    /// The card kept signalling busy past the wait limit: it held DO low for more than 5000 ms
+    /// before a command, or stayed in its initialization (busy) state through the ACMD41 or CMD58
+    /// init stage. The card is still driving the bus, so it is alive but not finishing its work.
+    BusyTimeout,
+    /// The card sent no R1 response within the Ncr window after a command, or never answered the
+    /// CMD0 or CMD8 init stage in time. The bus reads idle (0xFF), as if no card were present.
+    NoResponse,
+    /// The card accepted a read command but sent no data start token within 1000 ms.
+    ReadTimeout,
+    /// The card is not a supported SDHC/SDXC card or rejected the supply voltage.
     UnsupportedCard,
+    /// CMD58 (read OCR) did not return a ready R1.
     Cmd58Error,
+    /// CMD59 (CRC on) did not return an idle R1.
     Cmd59Error,
+    /// The card answered with an error R1, R2, or data token; the byte is attached.
     RegisterError(u8),
+    /// A data block's CRC16 did not match: `(received, calculated)`.
     CrcMismatch(u16, u16),
+    /// The card has not been initialized with [SdSpi::init].
     NotInitialized,
+    /// The card did not accept a written data block, or reported a write error afterwards.
     WriteError,
 }
 
@@ -119,11 +136,11 @@ where
         // A failed init must not leave a previous card's state in place.
         self.card = None;
         let r = async {
-            with_stage_timeout(self.delay.clone(), 1000, "CMD0 idle", async {
+            with_stage_timeout(self.delay.clone(), 1000, "CMD0 idle", Error::NoResponse, async {
                 loop {
                     match self.cmd(idle()).await {
                         Ok(R1_IDLE_STATE) => return Ok(()),
-                        Ok(_) | Err(Error::Timeout) => {}
+                        Ok(_) | Err(Error::NoResponse) => {}
                         Err(e) => return Err(e),
                     }
                     self.delay.delay_ms(1).await;
@@ -131,7 +148,7 @@ where
             })
             .await?;
 
-            with_stage_timeout(self.delay.clone(), 1000, "CMD8", async {
+            with_stage_timeout(self.delay.clone(), 1000, "CMD8", Error::NoResponse, async {
                 loop {
                     let mut buffer = [0xFFu8; 4];
                     let r = self
@@ -167,7 +184,7 @@ where
             let mut card = Card::default();
 
             // Send ACMD41 with HCS=1 and reserved/S18R bits cleared (0x4000_0000 per SPI spec §7.3.1.3).
-            with_stage_timeout(self.delay.clone(), 2000, "ACMD41 ready", async {
+            with_stage_timeout(self.delay.clone(), 2000, "ACMD41 ready", Error::BusyTimeout, async {
                 loop {
                     let r = self
                         .acmd(sd_send_op_cond(true, false, false, 0))
@@ -184,7 +201,7 @@ where
             .await?;
 
             trace!("send_ocr");
-            card.ocr = with_stage_timeout(self.delay.clone(), 1000, "CMD58 OCR", async {
+            card.ocr = with_stage_timeout(self.delay.clone(), 1000, "CMD58 OCR", Error::BusyTimeout, async {
                 loop {
                     let mut buffer = [0xFFu8; 4];
                     let r = self
@@ -360,7 +377,13 @@ where
     /// block, which SD Part 1 §7.2 does not allow. Fixing this needs a bounded wait, so it is a
     /// known gap and not covered by the command/response CS change.
     async fn read_data(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
-        let r = with_timeout(self.delay.clone(), 1000, self.poll_byte(|b| b != 0xFF)).await??;
+        let r = with_timeout(
+            self.delay.clone(),
+            1000,
+            Error::ReadTimeout,
+            self.poll_byte(|b| b != 0xFF),
+        )
+        .await??;
 
         if r != DATA_START_BLOCK {
             return Err(Error::RegisterError(r));
@@ -517,7 +540,7 @@ where
             return Ok((r1, avail));
         }
 
-        Err(Error::Timeout)
+        Err(Error::NoResponse)
     }
 
     async fn acmd<R: Resp>(&mut self, cmd: Cmd<R>) -> Result<u8, Error> {
@@ -535,7 +558,7 @@ where
     /// it as card busy time.
     async fn wait_idle(&mut self) -> Result<(), Error> {
         let mut sleep = self.delay.clone();
-        with_timeout(self.delay.clone(), 5000, async {
+        with_timeout(self.delay.clone(), 5000, Error::BusyTimeout, async {
             let mut polls = 0;
             while self.read_byte().await? != 0xFF {
                 polls += 1;
@@ -606,35 +629,40 @@ where
     }
 }
 
+/// Runs `fut` for at most `timeout` ms and returns `expired` if the time runs out first.
 async fn with_timeout<D: embedded_hal_async::delay::DelayNs, F: Future>(
     mut delay: D,
     timeout: u32,
+    expired: Error,
     fut: F,
 ) -> Result<F::Output, Error> {
     match select(fut, delay.delay_ms(timeout)).await {
         Either::First(r) => Ok(r),
-        Either::Second(_) => Err(Error::Timeout),
+        Either::Second(_) => Err(expired),
     }
 }
 
+/// Runs one init stage for at most `timeout` ms, returning `expired` when the stage runs out of
+/// time. Any timeout, from the stage limit or from a command inside it, is logged with the stage.
 async fn with_stage_timeout<D, F, T>(
     delay: D,
     timeout: u32,
     stage: &str,
+    expired: Error,
     fut: F,
 ) -> Result<T, Error>
 where
     D: embedded_hal_async::delay::DelayNs,
     F: Future<Output = Result<T, Error>>,
 {
-    match with_timeout(delay, timeout, fut).await {
-        Ok(Ok(v)) => Ok(v),
-        Ok(Err(Error::Timeout)) | Err(Error::Timeout) => {
-            warn!("SD init timeout waiting for {}", stage);
-            Err(Error::Timeout)
-        }
-        Ok(Err(e)) | Err(e) => Err(e),
+    let r = match with_timeout(delay, timeout, expired, fut).await {
+        Ok(r) => r,
+        Err(e) => Err(e),
+    };
+    if let Err(e @ (Error::BusyTimeout | Error::NoResponse | Error::ReadTimeout)) = r {
+        warn!("SD init timeout waiting for {}: {:?}", stage, e);
     }
+    r
 }
 
 /// Fails unless a command's R1 response reports no error. A data command the card rejected must
